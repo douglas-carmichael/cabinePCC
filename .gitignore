@@ -1,0 +1,19 @@
+# XcodeGen output -- regenerate with `xcodegen generate`
+CabinePCC.xcodeproj/
+
+# Xcode build products
+build/
+DerivedData/
+
+# The engine package's SwiftPM build products
+Engine/.build/
+Engine/.swiftpm/
+
+# Logs / scratch
+*.log
+
+# Mac
+.DS_Store
+
+# Python's cache, beside the scripts
+__pycache__/

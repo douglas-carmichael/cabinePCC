@@ -1,0 +1,335 @@
+import Foundation
+
+/// Reusable readline-style line discipline that drives a `DCLEngine`.
+/// The local SwiftUI terminal view (`VTShellView`) and each telnet
+/// session (`DCLTelnetServer`) both wrap their byte stream in one of
+/// these so cursor keys, mid-line editing, and Up / Down history work
+/// identically across local and remote connections.
+///
+/// `write` is the closure that emits raw bytes (as a String of ASCII
+/// glyphs and / or VT escape sequences) to wherever the user is sitting
+/// -- the local emulator's `feed(text:)` call, or a TCP socket's send.
+/// Bytes pushed through `write` do NOT pass through `DCLEngine.out`, so
+/// they never land in the transcript -- they're purely terminal control
+/// (CR, prompt redraw, line-erase). The engine's regular output (banner,
+/// SHOW responses, prompt after submit) still flows through the engine's
+/// `outputHandler`, which the caller wires separately.
+@MainActor
+final class LineDiscipline {
+    private let dcl: DCLEngine
+    private let write: (String) -> Void
+
+    /// UTF-8 bytes for the current input line. `cursor` is a byte offset
+    /// that always sits on a character boundary -- continuation bytes
+    /// (0x80...0xBF) move with their leading byte as one unit.
+    private var inputBytes: [UInt8] = []
+    private var cursor: Int = 0
+
+    /// Index into `dcl.history` while the user is browsing it with the
+    /// Up / Down arrows. `nil` means they're editing a fresh line.
+    private var historyIndex: Int? = nil
+    /// Working draft preserved when the user presses Up the first time,
+    /// so Down past the newest entry restores what they had typed.
+    private var savedDraft: [UInt8] = []
+
+    private enum EscState {
+        case normal
+        case sawESC
+        case inCSI
+    }
+    private var escState: EscState = .normal
+
+    init(dcl: DCLEngine, write: @escaping (String) -> Void) {
+        self.dcl = dcl
+        self.write = write
+    }
+
+    // MARK: -- Entry point
+
+    func process(_ bytes: [UInt8]) {
+        // Live full-screen modes own the byte stream completely.
+        if case .form = dcl.liveMode {
+            dcl.handleFormKey(bytes)
+            return
+        }
+        if case .screenEditor = dcl.liveMode {
+            dcl.handleScreenEditorKey(bytes)
+            return
+        }
+        // A DCLix DECforms panel. Tested through a bridge-provided flag
+        // rather than a LiveMode case, so that enum is unchanged.
+        if dcl.dclixWantsKeystrokes {
+            dcl.handleDCLixFormKey(bytes)
+            return
+        }
+        var dirty = false
+        for b in bytes {
+            switch escState {
+            case .sawESC:
+                if b == 0x5B {
+                    escState = .inCSI
+                } else if b == 0x1B {
+                    // ESC ESC: an alternative interrupt gesture for
+                    // users whose tty driver eats ^Y / ^C / ^Z (DSUSP /
+                    // INTR / SUSP -- a common problem when connecting
+                    // via `nc localhost 2324` from a macOS terminal,
+                    // where the local tty layer intercepts those bytes
+                    // before nc forwards them to us).
+                    escState = .normal
+                    if dcl.liveActive {
+                        dcl.stopMonitor(interrupt: true)
+                    } else if dcl.mailComposingBody {
+                        // ESC ESC finishes a MAIL message body for telnet
+                        // users whose tty eats CTRL/Z (the same fallback the
+                        // screen editor offers).
+                        endMailBody()
+                    } else if dcl.helpActive {
+                        // ESC ESC leaves HELP for telnet users whose tty
+                        // eats CTRL/Z.
+                        exitHelp()
+                    }
+                } else {
+                    escState = .normal
+                }
+                continue
+            case .inCSI:
+                if (0x40...0x7E).contains(b) {
+                    // Cursor keys edit the command line, which a live
+                    // display doesn't have -- swallow them there.
+                    if !dcl.liveActive {
+                        handleCSI(final: b)
+                        dirty = true
+                    }
+                    escState = .normal
+                }
+                continue
+            case .normal:
+                break
+            }
+            // A live display (MONITOR, the PCC's SMG screens) owns the
+            // screen: only its control keys -- ESC
+            // (for ESC ESC), CTRL/C, CTRL/Y, CTRL/Z, CTRL/W -- get through.
+            // Anything else would edit the hidden input line and redraw
+            // the prompt over the display.
+            if dcl.liveActive, ![0x1B, 0x03, 0x19, 0x1A, 0x17].contains(b) {
+                continue
+            }
+            switch b {
+            case 0x1B:
+                escState = .sawESC
+            case 0x0D, 0x0A:
+                submitLine()
+                dirty = false
+            case 0x08, 0x7F:
+                backspaceAtCursor()
+                dirty = true
+            case 0x03, 0x19:
+                if dcl.liveActive {
+                    dcl.stopMonitor(interrupt: true)
+                } else if dcl.scriptDepth > 0 || dcl.waiting {
+                    // A command procedure is running, or a WAIT: the
+                    // procedure stops at its next line, the WAIT at once,
+                    // and each says so itself.
+                    dcl.scriptInterrupted = true
+                } else if dcl.mailComposing {
+                    inputBytes.removeAll()
+                    cursor = 0
+                    historyIndex = nil
+                    dcl.abortMailMessage()
+                } else if dcl.helpActive {
+                    exitHelp()
+                } else {
+                    cancelLine()
+                }
+                dirty = false
+            case 0x1A:
+                // CTRL/Z ends a MAIL message body, exits the HELP browser
+                // and the PCC's SMG screens, and is harmless elsewhere.
+                if dcl.isPasteboardActive {
+                    dcl.stopMonitor(interrupt: false, exitKey: true)
+                } else if dcl.mailComposingBody {
+                    endMailBody()
+                } else if dcl.helpActive {
+                    exitHelp()
+                }
+                dirty = false
+            case 0x17:
+                // CTRL/W repaints an SMG layered-product screen.
+                if dcl.isPasteboardActive {
+                    dcl.repaintPasteboard()
+                }
+                dirty = false
+            case 0x15:
+                killLine()
+                dirty = true
+            case 0x01:
+                cursor = 0
+                dirty = true
+            case 0x05:
+                cursor = inputBytes.count
+                dirty = true
+            case 0x09:
+                insertByte(0x20)
+                dirty = true
+            default:
+                if b >= 0x20 {
+                    insertByte(b)
+                    dirty = true
+                }
+            }
+        }
+        if dirty { redraw() }
+    }
+
+    // MARK: -- Buffer manipulation
+
+    private func insertByte(_ b: UInt8) {
+        inputBytes.insert(b, at: cursor)
+        cursor += 1
+        historyIndex = nil
+    }
+
+    private func backspaceAtCursor() {
+        guard cursor > 0 else { return }
+        repeat {
+            cursor -= 1
+            let removed = inputBytes.remove(at: cursor)
+            if removed & 0xC0 != 0x80 { break }
+        } while cursor > 0
+        historyIndex = nil
+    }
+
+    private func advanceCursor() {
+        guard cursor < inputBytes.count else { return }
+        cursor += 1
+        while cursor < inputBytes.count, inputBytes[cursor] & 0xC0 == 0x80 {
+            cursor += 1
+        }
+    }
+
+    private func retreatCursor() {
+        guard cursor > 0 else { return }
+        cursor -= 1
+        while cursor > 0, inputBytes[cursor] & 0xC0 == 0x80 {
+            cursor -= 1
+        }
+    }
+
+    private func killLine() {
+        inputBytes.removeAll()
+        cursor = 0
+        historyIndex = nil
+    }
+
+    private func cancelLine() {
+        inputBytes.removeAll()
+        cursor = 0
+        historyIndex = nil
+        write("\r\n")
+        dcl.out("%DCL-S-INTRUPT, interrupted\n")
+        dcl.out(dcl.prompt)
+    }
+
+    /// Finish a MAIL message body: the current partial input line (typed
+    /// but not yet Return-ed) becomes the last body line, then the engine
+    /// sends the message.
+    private func endMailBody() {
+        let line = String(decoding: inputBytes, as: UTF8.self)
+        inputBytes.removeAll()
+        cursor = 0
+        historyIndex = nil
+        write("\r\n")
+        dcl.endMailMessage(partial: line)
+    }
+
+    /// Leave the interactive HELP browser (CTRL/Z, CTRL/C or ESC ESC),
+    /// discarding any half-typed line and redisplaying the DCL prompt.
+    private func exitHelp() {
+        inputBytes.removeAll()
+        cursor = 0
+        historyIndex = nil
+        write("\r\n")
+        dcl.helpExit()
+        dcl.out(dcl.prompt)
+    }
+
+    private func submitLine() {
+        let line = String(decoding: inputBytes, as: UTF8.self)
+        inputBytes.removeAll()
+        cursor = 0
+        historyIndex = nil
+        write("\r\n")
+        // dcl.submit is async because WAIT actually pauses via Task.sleep;
+        // detach so the line-discipline keystroke handler returns
+        // immediately and we don't block keyboard input while a script
+        // is sleeping.
+        Task { @MainActor in
+            await dcl.submit(line)
+        }
+    }
+
+    // MARK: -- History
+
+    private func recallPreviousHistory() {
+        guard !dcl.history.isEmpty else { return }
+        if historyIndex == nil {
+            savedDraft = inputBytes
+            historyIndex = dcl.history.count - 1
+        } else if let idx = historyIndex, idx > 0 {
+            historyIndex = idx - 1
+        } else {
+            return
+        }
+        if let idx = historyIndex {
+            inputBytes = Array(dcl.history[idx].utf8)
+            cursor = inputBytes.count
+        }
+    }
+
+    private func recallNextHistory() {
+        guard let idx = historyIndex else { return }
+        let next = idx + 1
+        if next < dcl.history.count {
+            historyIndex = next
+            inputBytes = Array(dcl.history[next].utf8)
+        } else {
+            historyIndex = nil
+            inputBytes = savedDraft
+        }
+        cursor = inputBytes.count
+    }
+
+    // MARK: -- CSI dispatch
+
+    private func handleCSI(final: UInt8) {
+        switch final {
+        case 0x41: recallPreviousHistory()      // A - Up
+        case 0x42: recallNextHistory()          // B - Down
+        case 0x43: advanceCursor()              // C - Right
+        case 0x44: retreatCursor()              // D - Left
+        case 0x48: cursor = 0                   // H - Home
+        case 0x46: cursor = inputBytes.count    // F - End
+        default: break
+        }
+    }
+
+    // MARK: -- Redraw
+
+    private func redraw() {
+        var s = "\r"
+        s += dcl.prompt
+        s += String(decoding: inputBytes, as: UTF8.self)
+        s += "\u{1B}[K"
+        let total  = utf8GlyphCount(inputBytes)
+        let before = utf8GlyphCount(Array(inputBytes.prefix(cursor)))
+        let trailing = total - before
+        if trailing > 0 {
+            s += "\u{1B}[\(trailing)D"
+        }
+        write(s)
+    }
+
+    private func utf8GlyphCount(_ bytes: [UInt8]) -> Int {
+        bytes.reduce(0) { acc, b in acc + ((b & 0xC0 == 0x80) ? 0 : 1) }
+    }
+}

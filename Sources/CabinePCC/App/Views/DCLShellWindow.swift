@@ -1,0 +1,80 @@
+import SwiftUI
+import AppKit
+
+/// Window that hosts the retro VT220/320 emulator. The emulator is wired
+/// to a DCLEngine via VTShellView -- output goes through
+/// `dcl.outputHandler`, keystrokes route back through the line-discipline
+/// coordinator and into `dcl.submit(_:)`.
+struct DCLShellWindow: View {
+    // Each terminal window owns its own engine, so every window is an
+    // independent login (its own transcript / symbols / history / MAIL
+    // browse state). The node makes it, and attaches it to its world, its
+    // link and its language when the window appears.
+    @EnvironmentObject var language: AppLanguage
+    @StateObject private var dcl: DCLEngine
+    @State private var hostWindow: NSWindow?
+    @State private var didAttach = false
+    private let node: PCCNode
+
+    init(node: PCCNode) {
+        self.node = node
+        _dcl = StateObject(wrappedValue: node.makeSession(.interactive))
+    }
+
+    var body: some View {
+        // The shell screen grows its grid with the window at the VT323 16pt
+        // body font; full-screen displays use the fixed 80 x 24 alt screen,
+        // which scales to fill the window (RetroTerminalView.screenCols/
+        // screenRows). The minimum size keeps at least 80 x 24 at the
+        // prompt so the login banner + LPD splash don't scroll off.
+        VTShellView(dcl: dcl)
+            .frame(minWidth: 820, minHeight: 600)
+            .background(Color.black)
+            // No `.ignoresSafeArea()`: with it, the view extends under
+            // the macOS title bar and anything at row 0 (the Welcome
+            // banner line, the `$ ` prompt after CLEAR) gets hidden
+            // behind the chrome.
+            .background(WindowAccessor { hostWindow = $0 })
+            .navigationTitle(language.t("window.dcl"))
+            .onAppear {
+                // Attach exactly once per window. onAppear can re-fire (e.g.
+                // when the window is re-shown), and attach() repaints the
+                // whole login block, so guard against a second run.
+                guard !didAttach else { return }
+                didAttach = true
+                // Attached, and joined to the session set so exactly one
+                // live terminal owns the in-universe status-mail generator
+                // (see DCLSessionCoordinator).
+                node.attach(dcl)
+            }
+            .onDisappear {
+                node.sessions.unregister(dcl)
+            }
+            .onChange(of: dcl.loggedOut) { _, loggedOut in
+                // LOGOUT / EXIT closes the DCL window. We delay briefly so
+                // the operator sees the "logged out" line before the
+                // window disappears, then reset the flag so a future
+                // LOGOUT will fire.
+                guard loggedOut else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    hostWindow?.close()
+                    dcl.loggedOut = false
+                }
+            }
+    }
+}
+
+/// Captures the NSWindow hosting this SwiftUI view so we can close it
+/// programmatically (LOGOUT / EXIT in the DCL shell). This works on
+/// macOS 13+, unlike the SwiftUI dismissWindow environment value.
+private struct WindowAccessor: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { [weak v] in onResolve(v?.window) }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { [weak nsView] in onResolve(nsView?.window) }
+    }
+}

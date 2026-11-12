@@ -1,0 +1,705 @@
+import AppKit
+import Foundation
+
+/// Minimal VT-style terminal emulator written from scratch. Replaces
+/// SwiftTerm's TerminalView, which kept pushing the top of the diagnostic
+/// test display into scrollback no matter how we positioned the cursor or
+/// scoped the alt buffer. This emulator only speaks the subset of VT220 /
+/// xterm that the DCL shell actually emits:
+///
+///   * CR (0x0D), LF (0x0A), BS (0x08), TAB (0x09)
+///   * CSI cursor position: `ESC [ row;col H` and `ESC [ row;col f`
+///   * CSI erase in display: `ESC [ 0/1/2 J` (and `3 J` as no-op -- we
+///     don't keep scrollback so there's nothing to clear)
+///   * CSI erase in line:    `ESC [ 0/1/2 K`
+///   * CSI cursor movement:  `ESC [ <n> A/B/C/D`
+///   * DECSET 1049 / 25:      alt screen / cursor visibility
+///   * SGR is consumed but ignored -- we paint with the single configured
+///     foreground / background colour.
+///
+/// Anything outside this set is parsed (so we don't drop into a corrupt
+/// state) but applied as a no-op.
+final class RetroTerminalView: NSView {
+
+    // MARK: - Public API
+
+    /// Bytes the emulator generates from keystrokes flow out through this
+    /// callback. The DCL line discipline in VTShellView's coordinator
+    /// reads them.
+    var onInput: (([UInt8]) -> Void)?
+
+    /// Fires once, the first time the view has been sized to something
+    /// larger than the initial `.zero` frame. Callers use it to defer
+    /// feeding content until the buffer has real cols/rows -- otherwise
+    /// everything gets mashed into a 1x1 grid and then thrown away when
+    /// the view is reshaped.
+    var onReady: (() -> Void)?
+    private var hasReportedReady = false
+
+    var foregroundColor: NSColor = NSColor(srgbRed: 1.00, green: 0.72, blue: 0.20, alpha: 1) {
+        didSet { needsDisplay = true }
+    }
+    var backgroundColor: NSColor = NSColor(srgbRed: 0.04, green: 0.04, blue: 0.05, alpha: 1) {
+        didSet {
+            layer?.backgroundColor = backgroundColor.cgColor
+            needsDisplay = true
+        }
+    }
+
+    let font: NSFont
+
+    /// Fixed VT320 geometry of the alternate screen. The DCL full-screen
+    /// displays (the monitors, the two forms, EDT) all enter the alt
+    /// buffer and paint a 24 x 80 pasteboard,
+    /// so the alt screen is always 80 x 24 and its glyphs scale to fill
+    /// the window. The primary (shell) screen keeps the natural font size
+    /// and grows its grid with the window.
+    static let screenCols = 80
+    static let screenRows = 24
+
+    private var primaryCols: Int = 1
+    private var primaryRows: Int = 1
+
+    /// Dimensions of the active buffer.
+    var cols: Int { inAltBuffer ? Self.screenCols : primaryCols }
+    var rows: Int { inAltBuffer ? Self.screenRows : primaryRows }
+
+    // MARK: - Cell + Buffer
+
+    private struct Cell {
+        var character: Character = " "
+        /// Reverse video (SGR 7). A reversed cell swaps foreground and
+        /// background when painted -- even a reversed space is drawn as a
+        /// solid block, which is what makes MONITOR / EDT status bars read
+        /// as a filled bar rather than plain text.
+        var reverse: Bool = false
+    }
+
+    /// 2-D grid of cells. We keep two of these: the primary buffer and
+    /// the alternate buffer (entered/exited via DECSET 1049). Indexed
+    /// `[row][col]`, both 0-based.
+    private var primary: [[Cell]] = []
+    private var alternate: [[Cell]] = []
+    private var inAltBuffer: Bool = false
+
+    /// Current write target. Computed each access so callers can mutate
+    /// the grid via subscripts without copying the whole buffer.
+    private var buffer: [[Cell]] {
+        get { inAltBuffer ? alternate : primary }
+        set {
+            if inAltBuffer { alternate = newValue } else { primary = newValue }
+        }
+    }
+
+    // MARK: - Cursor
+
+    private var cursorRow: Int = 0
+    private var cursorCol: Int = 0
+    private var savedRow: Int = 0
+    private var savedCol: Int = 0
+    /// Cursor position stashed when we enter the alt buffer via DECSET
+    /// 1049 -- restored on exit so the prompt picks up where it left
+    /// off in the primary buffer rather than landing in mid-screen.
+    private var altReturnRow: Int = 0
+    private var altReturnCol: Int = 0
+    private var cursorVisible: Bool = true
+
+    /// Active graphic rendition applied to newly written cells. Only
+    /// reverse video (SGR 7) is honored; other attributes are consumed as
+    /// no-ops because the display uses a single phosphor palette.
+    private var currentReverse: Bool = false
+
+    // MARK: - Font metrics
+
+    private let cellWidth: CGFloat
+    private let cellHeight: CGFloat
+    private let glyphBaseline: CGFloat
+
+    // MARK: - CSI parser state
+
+    private enum ParserState {
+        case ground
+        case escape
+        case csi
+    }
+    private var parser: ParserState = .ground
+    private var csiPrivate: Bool = false
+    private var csiParams: [Int] = []
+    private var csiCurrent: Int = 0
+    private var csiHasDigit: Bool = false
+
+    // MARK: - Init
+
+    init(frame: CGRect, font: NSFont) {
+        self.font = font
+        // Cell width: true glyph advance via CoreText (NSString.size
+        // returns inked extent, which under-reports for pixel fonts
+        // like VT323 and made the cursor render as a sliver).
+        // Cell height: NSLayoutManager.defaultLineHeight matches what
+        // NSAttributedString.draw lays out, so glyphs and cursor align.
+        let ctFont = font as CTFont
+        var chars: [UniChar] = [0x4D]                    // 'M'
+        var glyph: CGGlyph = 0
+        CTFontGetGlyphsForCharacters(ctFont, &chars, &glyph, 1)
+        var advance: CGSize = .zero
+        CTFontGetAdvancesForGlyphs(ctFont, .horizontal, [glyph], &advance, 1)
+        self.cellWidth = max(1, ceil(advance.width))
+        let mgr = NSLayoutManager()
+        self.cellHeight = max(1, ceil(mgr.defaultLineHeight(for: font)))
+        // NSLayoutManager packs the glyph so its baseline sits at
+        // (cellHeight + font.descender) from the cell top; descender
+        // is negative for most fonts.
+        self.glyphBaseline = ceil(self.cellHeight + font.descender)
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = backgroundColor.cgColor
+        alternate = Self.blankScreen(cols: Self.screenCols, rows: Self.screenRows)
+        recomputeGrid()
+    }
+
+    private static func blankScreen(cols: Int, rows: Int) -> [[Cell]] {
+        Array(repeating: Array(repeating: Cell(), count: cols), count: rows)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    // MARK: - Resize
+
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        recomputeGrid()
+        needsDisplay = true
+        if !hasReportedReady, primaryCols > 1, primaryRows > 1 {
+            hasReportedReady = true
+            onReady?()
+        }
+    }
+
+    /// Recompute the primary screen's cols/rows from the current bounds
+    /// and reshape it preserving existing content (truncated to the new
+    /// dimensions). Reserves one cell of vertical padding at the bottom
+    /// so the prompt row (which is always cursor's row after engine
+    /// output) isn't clipped by the window's bottom edge / chrome. The
+    /// alt screen is fixed at 80 x 24 and only rescales.
+    private func recomputeGrid() {
+        let newCols = max(1, Int(bounds.width / cellWidth))
+        let newRows = max(1, Int((bounds.height - cellHeight) / cellHeight))
+        if newCols == primaryCols && newRows == primaryRows && !primary.isEmpty { return }
+        primaryCols = newCols
+        primaryRows = newRows
+        primary = Self.reshape(primary, cols: newCols, rows: newRows)
+        if !inAltBuffer {
+            cursorRow = min(cursorRow, max(0, rows - 1))
+            cursorCol = min(cursorCol, max(0, cols - 1))
+        } else {
+            altReturnRow = min(altReturnRow, max(0, newRows - 1))
+            altReturnCol = min(altReturnCol, max(0, newCols - 1))
+        }
+    }
+
+    private static func reshape(_ src: [[Cell]], cols: Int, rows: Int) -> [[Cell]] {
+        var result = blankScreen(cols: cols, rows: rows)
+        for r in 0..<min(rows, src.count) {
+            for c in 0..<min(cols, src[r].count) {
+                result[r][c] = src[r][c]
+            }
+        }
+        return result
+    }
+
+    /// Uniform scale that fits the 80 x 24 alt screen (laid out at the
+    /// font's natural cell size) into the view, keeping the glyph aspect
+    /// ratio. The primary screen always draws at its natural size.
+    /// A small inset keeps the outer rows/columns off the window edge.
+    private static let screenInset: CGFloat = 6
+
+    private var screenScale: CGFloat {
+        guard inAltBuffer else { return 1 }
+        let naturalW = CGFloat(cols) * cellWidth
+        let naturalH = CGFloat(rows) * cellHeight
+        let availW = max(1, bounds.width  - 2 * Self.screenInset)
+        let availH = max(1, bounds.height - 2 * Self.screenInset)
+        return max(0.01, min(availW / naturalW, availH / naturalH))
+    }
+
+    /// Top-left corner of the scaled screen: centred in the leftover
+    /// letterbox space along whichever axis has slack.
+    private var screenOrigin: CGPoint {
+        guard inAltBuffer else { return .zero }
+        let s = screenScale
+        let w = CGFloat(cols) * cellWidth * s
+        let h = CGFloat(rows) * cellHeight * s
+        return CGPoint(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2)
+    }
+
+    // MARK: - Feed
+
+    /// Push a chunk of text / control bytes through the parser.
+    func feed(text: String) {
+        for scalar in text.unicodeScalars {
+            handleScalar(scalar)
+        }
+        needsDisplay = true
+    }
+
+    /// Convenience for legacy byte-array callers.
+    func feed(byteArray: [UInt8]) {
+        feed(text: String(decoding: byteArray, as: UTF8.self))
+    }
+
+    /// Drive the parser one Unicode scalar at a time. The scalar
+    /// granularity is enough for our needs -- DCL never emits combined
+    /// graphemes through the engine, and the box-drawing chars are all
+    /// single scalars.
+    private func handleScalar(_ scalar: Unicode.Scalar) {
+        switch parser {
+        case .ground:
+            handleGround(scalar)
+        case .escape:
+            handleEscape(scalar)
+        case .csi:
+            handleCSI(scalar)
+        }
+    }
+
+    private func handleGround(_ scalar: Unicode.Scalar) {
+        switch scalar.value {
+        case 0x1B:                                  // ESC
+            parser = .escape
+        case 0x0D:                                  // CR
+            cursorCol = 0
+        case 0x0A:                                  // LF
+            lineFeed()
+        case 0x08:                                  // BS
+            if cursorCol > 0 { cursorCol -= 1 }
+        case 0x09:                                  // TAB -> next 8-col stop
+            let next = ((cursorCol / 8) + 1) * 8
+            cursorCol = min(cols - 1, next)
+        case 0x07:                                  // BEL -- silent
+            break
+        case 0x00...0x1F:                           // other C0 -- swallow
+            break
+        default:
+            if cursorCol >= cols {
+                // Soft wrap: previous char hit the right edge.
+                cursorCol = 0
+                lineFeed()
+            }
+            putChar(Character(scalar))
+            cursorCol += 1
+        }
+    }
+
+    private func putChar(_ ch: Character) {
+        guard cursorRow >= 0, cursorRow < rows,
+              cursorCol >= 0, cursorCol < cols else { return }
+        var buf = buffer
+        buf[cursorRow][cursorCol].character = ch
+        buf[cursorRow][cursorCol].reverse = currentReverse
+        buffer = buf
+    }
+
+    /// Move cursor down one row. If already on the bottom row, scroll
+    /// the buffer up by one (oldest row falls off the top). Only the
+    /// active buffer is affected.
+    private func lineFeed() {
+        if cursorRow < rows - 1 {
+            cursorRow += 1
+        } else {
+            scrollUp()
+        }
+    }
+
+    private func scrollUp() {
+        var buf = buffer
+        if buf.count >= 1 {
+            buf.removeFirst()
+            buf.append(Array(repeating: Cell(), count: cols))
+        }
+        buffer = buf
+    }
+
+    // MARK: - ESC parser
+
+    private func handleEscape(_ scalar: Unicode.Scalar) {
+        switch scalar.value {
+        case 0x5B:                                  // '['
+            parser = .csi
+            csiPrivate = false
+            csiParams = []
+            csiCurrent = 0
+            csiHasDigit = false
+        case 0x37:                                  // '7' DECSC -- save cursor
+            savedRow = cursorRow
+            savedCol = cursorCol
+            parser = .ground
+        case 0x38:                                  // '8' DECRC -- restore cursor
+            cursorRow = savedRow
+            cursorCol = savedCol
+            parser = .ground
+        case 0x63:                                  // 'c' RIS -- full reset
+            inAltBuffer = false
+            primary   = Self.blankScreen(cols: primaryCols, rows: primaryRows)
+            alternate = Self.blankScreen(cols: Self.screenCols, rows: Self.screenRows)
+            cursorRow = 0
+            cursorCol = 0
+            currentReverse = false
+            parser = .ground
+        case 0x44, 0x45, 0x4D:                      // 'D'/'E'/'M' -- index / next-line / reverse-index
+            // Treated as LF for our needs.
+            lineFeed()
+            if scalar == "E" { cursorCol = 0 }
+            parser = .ground
+        case 0x28, 0x29, 0x2A, 0x2B:                // SCS designators -- swallow next char
+            parser = .escape // crude but unused by DCL
+        default:
+            parser = .ground
+        }
+    }
+
+    private func handleCSI(_ scalar: Unicode.Scalar) {
+        let v = scalar.value
+        // Parameter accumulation
+        if v >= 0x30 && v <= 0x39 {                 // '0'..'9'
+            csiCurrent = csiCurrent * 10 + Int(v - 0x30)
+            csiHasDigit = true
+            return
+        }
+        if v == 0x3B {                              // ';'
+            csiParams.append(csiHasDigit ? csiCurrent : -1)
+            csiCurrent = 0
+            csiHasDigit = false
+            return
+        }
+        if v == 0x3F && csiParams.isEmpty && !csiHasDigit {
+            csiPrivate = true
+            return
+        }
+        // Final byte: 0x40 .. 0x7E
+        if v >= 0x40 && v <= 0x7E {
+            csiParams.append(csiHasDigit ? csiCurrent : -1)
+            executeCSI(final: scalar)
+            parser = .ground
+            return
+        }
+        // Anything else aborts the sequence.
+        parser = .ground
+    }
+
+    private func param(_ index: Int, default def: Int) -> Int {
+        guard index < csiParams.count else { return def }
+        let v = csiParams[index]
+        return v < 0 ? def : v
+    }
+
+    private func executeCSI(final: Unicode.Scalar) {
+        switch final {
+        case "H", "f":                              // CUP / HVP -- cursor position
+            let r = max(1, param(0, default: 1)) - 1
+            let c = max(1, param(1, default: 1)) - 1
+            cursorRow = min(max(0, r), rows - 1)
+            cursorCol = min(max(0, c), cols - 1)
+        case "A":                                   // CUU
+            cursorRow = max(0, cursorRow - max(1, param(0, default: 1)))
+        case "B":                                   // CUD
+            cursorRow = min(rows - 1, cursorRow + max(1, param(0, default: 1)))
+        case "C":                                   // CUF
+            cursorCol = min(cols - 1, cursorCol + max(1, param(0, default: 1)))
+        case "D":                                   // CUB
+            cursorCol = max(0, cursorCol - max(1, param(0, default: 1)))
+        case "G":                                   // CHA -- cursor to col
+            cursorCol = min(cols - 1, max(0, param(0, default: 1) - 1))
+        case "d":                                   // VPA -- cursor to row
+            cursorRow = min(rows - 1, max(0, param(0, default: 1) - 1))
+        case "J":                                   // ED
+            eraseInDisplay(param(0, default: 0))
+        case "K":                                   // EL
+            eraseInLine(param(0, default: 0))
+        case "h":
+            handleSetMode(set: true)
+        case "l":
+            handleSetMode(set: false)
+        case "s":                                   // SCP -- save cursor
+            savedRow = cursorRow
+            savedCol = cursorCol
+        case "u":                                   // RCP -- restore cursor
+            cursorRow = savedRow
+            cursorCol = savedCol
+        case "m":
+            applySGR()
+        default:
+            break
+        }
+    }
+
+    /// Select Graphic Rendition. We honor reverse video (7 on / 27 off) and
+    /// treat 0 (or an empty `CSI m`) as a full reset. Bold, underline, and
+    /// colour attributes are accepted but ignored -- the phosphor palette is
+    /// fixed -- so a sequence like `CSI 1 m` simply leaves reverse untouched.
+    private func applySGR() {
+        for p in csiParams {
+            switch p {
+            case 0, -1: currentReverse = false      // reset / bare `CSI m`
+            case 7:     currentReverse = true       // reverse video on
+            case 27:    currentReverse = false      // reverse video off
+            default:    break                       // bold/underline/colour: no-op
+            }
+        }
+    }
+
+    private func handleSetMode(set: Bool) {
+        guard csiPrivate else { return }
+        for p in csiParams {
+            switch p {
+            case 25:                                // DECTCEM -- cursor visibility
+                cursorVisible = set
+            case 47, 1047, 1049:                    // alt screen variants
+                if set {
+                    if !inAltBuffer {
+                        // Stash the primary cursor so we can return to
+                        // the same line when DECSET 1049l fires.
+                        altReturnRow = cursorRow
+                        altReturnCol = cursorCol
+                        // Snap into alt buffer; clear it on entry.
+                        alternate = Self.blankScreen(cols: Self.screenCols, rows: Self.screenRows)
+                        inAltBuffer = true
+                        needsDisplay = true
+                        cursorRow = 0
+                        cursorCol = 0
+                    }
+                } else {
+                    if inAltBuffer {
+                        inAltBuffer = false
+                        cursorRow = min(altReturnRow, rows - 1)
+                        cursorCol = min(altReturnCol, cols - 1)
+                    }
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    private func eraseInDisplay(_ kind: Int) {
+        switch kind {
+        case 0:
+            // From cursor to end of screen.
+            var buf = buffer
+            for c in cursorCol..<cols { buf[cursorRow][c] = Cell() }
+            for r in (cursorRow + 1)..<rows {
+                buf[r] = Array(repeating: Cell(), count: cols)
+            }
+            buffer = buf
+        case 1:
+            // From start of screen to cursor.
+            var buf = buffer
+            for r in 0..<cursorRow {
+                buf[r] = Array(repeating: Cell(), count: cols)
+            }
+            for c in 0...min(cursorCol, cols - 1) { buf[cursorRow][c] = Cell() }
+            buffer = buf
+        case 2, 3:
+            // Entire screen. (3 also clears scrollback, but we have none.)
+            buffer = Array(repeating: Array(repeating: Cell(), count: cols), count: rows)
+        default:
+            break
+        }
+    }
+
+    private func eraseInLine(_ kind: Int) {
+        var buf = buffer
+        switch kind {
+        case 0:
+            for c in cursorCol..<cols { buf[cursorRow][c] = Cell() }
+        case 1:
+            for c in 0...min(cursorCol, cols - 1) { buf[cursorRow][c] = Cell() }
+        case 2:
+            buf[cursorRow] = Array(repeating: Cell(), count: cols)
+        default:
+            break
+        }
+        buffer = buf
+    }
+
+    // MARK: - Drawing
+
+    /// Draws one character in its cell. VT323 has no geometric shapes (the
+    /// station markers of the mimic board, the bullet of a form), so they
+    /// come from a fallback font and are wider than a cell: each is
+    /// condensed to the cell's width, and does not run into the character
+    /// beside it. Box-drawing characters come from the fallback font too
+    /// and are left as they come: that they overlap is what joins one
+    /// cell's rule to the next without a seam.
+    private func drawGlyph(_ character: Character, _ attributes: [NSAttributedString.Key: Any],
+                           at origin: CGPoint, in ctx: CGContext) {
+        let string = NSAttributedString(string: String(character), attributes: attributes)
+        guard let scalar = character.unicodeScalars.first, (0x25A0...0x25FF).contains(scalar.value) else {
+            string.draw(at: origin)
+            return
+        }
+        let width = string.size().width
+        guard width > cellWidth else {
+            string.draw(at: origin)
+            return
+        }
+        ctx.saveGState()
+        ctx.translateBy(x: origin.x, y: 0)
+        ctx.scaleBy(x: cellWidth / width, y: 1)
+        string.draw(at: CGPoint(x: 0, y: origin.y))
+        ctx.restoreGState()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.setFillColor(backgroundColor.cgColor)
+        ctx.fill(bounds)
+
+        // Lay the grid out at the font's natural cell size and let the CTM
+        // scale it up to fill the window. NSAttributedString.draw renders
+        // through the same CGContext, so the transform applies to glyphs,
+        // reverse-video blocks and the cursor alike, and the vector font
+        // stays crisp at any size.
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        let origin = screenOrigin
+        ctx.translateBy(x: origin.x, y: origin.y)
+        ctx.scaleBy(x: screenScale, y: screenScale)
+        // In this flipped view NSAttributedString.draw(at:) takes the
+        // point as the line's TOP, so drawing at rowTop + glyphBaseline
+        // lands each row glyphBaseline below its cell. The primary screen
+        // absorbs that in its spare bottom row; the fixed 80 x 24 alt
+        // screen has none, so shift it back up or row 24 is clipped.
+        if inAltBuffer { ctx.translateBy(x: 0, y: -glyphBaseline) }
+
+        // Build a single attributed string per row and render in one
+        // shot. The fixed-pitch font keeps the column math trivial.
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: foregroundColor
+        ]
+        // Reverse-video cells: the background is painted as a full-block
+        // glyph in the foreground colour (the same drawing path the cursor
+        // uses -- ctx.fill's rect misaligns by a row in this flipped view),
+        // then the character is stamped on top in the background colour.
+        let blockAttrs = attrs
+        let reverseGlyphAttrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: backgroundColor
+        ]
+        for r in 0..<min(rows, buffer.count) {
+            let row = buffer[r]
+            // Trim trailing cells that need no paint. A reversed cell always
+            // needs painting (its block shows) even when it holds a space.
+            var lastPaint = -1
+            for c in (0..<cols).reversed()
+                where c < row.count && (row[c].character != " " || row[c].reverse) {
+                lastPaint = c
+                break
+            }
+            if lastPaint < 0 { continue }
+            let y = CGFloat(r) * cellHeight + glyphBaseline
+            // Draw each character cell-aligned. Even with a monospace
+            // font, AppKit's text drawing can drift over long lines on
+            // some fonts -- per-cell drawing keeps the grid honest.
+            for c in 0...lastPaint {
+                let cell = c < row.count ? row[c] : Cell()
+                let cellOrigin = CGPoint(x: CGFloat(c) * cellWidth, y: y)
+                if cell.reverse {
+                    NSAttributedString(string: "\u{2588}", attributes: blockAttrs)
+                        .draw(at: cellOrigin)
+                    if cell.character != " " {
+                        drawGlyph(cell.character, reverseGlyphAttrs, at: cellOrigin, in: ctx)
+                    }
+                } else if cell.character != " " {
+                    drawGlyph(cell.character, attrs, at: cellOrigin, in: ctx)
+                }
+            }
+        }
+
+        // Cursor: render as a `█` character using the SAME drawing path
+        // as the rest of the text. Earlier attempts used ctx.fill(rect)
+        // for the cursor block, but the rect's y didn't line up with
+        // where NSAttributedString.draw actually places glyphs in this
+        // flipped view -- the block appeared one row above the prompt
+        // it was supposed to mark. Drawing a glyph guarantees alignment.
+        if cursorVisible,
+           cursorRow >= 0, cursorRow < rows,
+           cursorCol >= 0, cursorCol < cols {
+            let cursorY = CGFloat(cursorRow) * cellHeight + glyphBaseline
+            let cursorX = CGFloat(cursorCol) * cellWidth
+            let fgAttrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: foregroundColor
+            ]
+            NSAttributedString(string: "\u{2588}", attributes: fgAttrs)
+                .draw(at: CGPoint(x: cursorX, y: cursorY))
+            // If there's a visible glyph under the cursor, re-stamp it
+            // in the background colour so the user can still read it.
+            if cursorRow < buffer.count, cursorCol < buffer[cursorRow].count {
+                let ch = buffer[cursorRow][cursorCol].character
+                if ch != " " {
+                    let bgAttrs: [NSAttributedString.Key: Any] = [
+                        .font: font,
+                        .foregroundColor: backgroundColor
+                    ]
+                    NSAttributedString(string: String(ch), attributes: bgAttrs)
+                        .draw(at: CGPoint(x: cursorX, y: cursorY))
+                }
+            }
+        }
+    }
+
+    // MARK: - Keyboard
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            window?.makeFirstResponder(self)
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        var bytes: [UInt8] = []
+        let modifiers = event.modifierFlags
+        let ctrl = modifiers.contains(.control)
+
+        if let chars = event.charactersIgnoringModifiers, !chars.isEmpty {
+            switch event.keyCode {
+            case 0x24:                              // Return
+                bytes = [0x0D]
+            case 0x33:                              // Delete (Backspace)
+                bytes = [0x7F]
+            case 0x35:                              // Escape
+                bytes = [0x1B]
+            case 0x30:                              // Tab
+                bytes = [0x09]
+            case 0x7E:                              // Up arrow
+                bytes = [0x1B, 0x5B, 0x41]
+            case 0x7D:                              // Down
+                bytes = [0x1B, 0x5B, 0x42]
+            case 0x7C:                              // Right
+                bytes = [0x1B, 0x5B, 0x43]
+            case 0x7B:                              // Left
+                bytes = [0x1B, 0x5B, 0x44]
+            default:
+                // Honor Ctrl-letter combos.
+                if ctrl, let first = chars.unicodeScalars.first,
+                   first.value >= 0x40 && first.value < 0x80 {
+                    let masked = UInt8(first.value & 0x1F)
+                    bytes = [masked]
+                } else {
+                    bytes = Array(chars.utf8)
+                }
+            }
+        }
+
+        if !bytes.isEmpty {
+            onInput?(bytes)
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+}

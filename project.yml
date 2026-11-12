@@ -1,0 +1,113 @@
+name: CabinePCC
+options:
+  bundleIdPrefix: net.dcarmichael
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+packages:
+  DCLixKit:
+    path: DCLixKit
+  Engine:
+    path: Engine
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: NO
+    DEAD_CODE_STRIPPING: YES
+
+targets:
+  # The app: the core and the windows.
+  CabinePCC:
+    type: application
+    platform: macOS
+    dependencies:
+      - package: DCLixKit
+      - package: Engine
+        product: CabinePCCKit
+    sources:
+      - path: Sources/CabinePCC
+      - path: Resources/Fonts
+      - path: Resources/Assets.xcassets
+      # The library of lines the app is built with, as a folder: Contents/Resources/Lines.
+      - path: Lines
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.dcarmichael.CabinePCC
+        # The engine's namespace is an enum called CabinePCC: the app's module goes by another name.
+        PRODUCT_MODULE_NAME: CabinePCCApp
+        CODE_SIGN_ENTITLEMENTS: Resources/CabinePCC.entitlements
+        COMBINE_HIDPI_IMAGES: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleName: CabinePCC
+        CFBundleDisplayName: Cabine PCC
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "15.0"
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHighResolutionCapable: true
+        NSQuitAlwaysKeepsWindows: false
+        NSPrincipalClass: NSApplication
+        NSLocalNetworkUsageDescription: "Cabine PCC listens for the Cabine cabs on your local network, and advertises itself there by Bonjour."
+        NSBonjourServices:
+          - _cabinepcc._tcp
+        ATSApplicationFontsPath: "."
+
+  # The same core with no window: serves, tests itself, and carries out one command for the docs.
+  cabinepcc-headless:
+    type: tool
+    platform: macOS
+    dependencies:
+      - package: DCLixKit
+      - package: Engine
+        product: CabinePCCKit
+    sources:
+      - path: Sources/CabinePCC/Core
+      - path: Sources/Headless
+      # The library of lines, beside the tool in the products folder.
+      - path: Lines
+        type: folder
+        buildPhase:
+          copyFiles:
+            destination: productsDirectory
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.dcarmichael.cabinepcc-headless
+        PRODUCT_MODULE_NAME: CabinePCCHeadless
+        # A tool has no bundle: what the system asks of it about the local network goes in the binary.
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+    info:
+      path: Resources/Headless-Info.plist
+      properties:
+        CFBundleName: cabinepcc-headless
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        NSLocalNetworkUsageDescription: "Cabine PCC listens for the Cabine cabs on your local network, and advertises itself there by Bonjour."
+        NSBonjourServices:
+          - _cabinepcc._tcp
+
+schemes:
+  CabinePCC:
+    build:
+      targets:
+        CabinePCC: all
+    run:
+      config: Debug
+  cabinepcc-headless:
+    build:
+      targets:
+        cabinepcc-headless: all
+    run:
+      config: Debug

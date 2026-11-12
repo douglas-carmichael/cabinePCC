@@ -1,0 +1,35 @@
+name: Engine
+
+# Builds the engine package of cabinePCC, the PCC end of the Cabine link (docs/cabine-link.md), in debug
+# and in release, and runs its self-test: the wire against the specification's own examples, the checks
+# on a line description, the packages of Lines/ read, written back and handed to a cab, the engine for
+# an hour of simulated time on each line, a scripted cab, the server over TCP on 127.0.0.1, and the
+# library's rules.
+
+on:
+  push:
+    branches: [main]
+    paths: ['Engine/**', 'Lines/**', '.github/workflows/engine.yml']
+  pull_request:
+    branches: [main]
+    paths: ['Engine/**', 'Lines/**', '.github/workflows/engine.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: Engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: swift build
+
+      - name: Build, release
+        run: swift build -c release
+
+      # On the built-in line and on every line of ../Lines.
+      - name: Self-test
+        run: swift run cabine-pccd --selftest

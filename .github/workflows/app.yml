@@ -1,0 +1,63 @@
+name: App
+
+# Checks the string table, builds the two targets of the XcodeGen-generated project on macOS, the
+# CabinePCC app and the cabinepcc-headless tool, and runs the tool's self-test: the DCL SELFTEST in
+# English and in French, then a PCC serving scripted cabs over loopback, with every PCC verb, alarm,
+# monitor and form checked against the engine. The .xcodeproj is .gitignore'd (generated from
+# project.yml), so CI installs XcodeGen and runs `xcodegen generate` first. DCLixKit is a git submodule
+# both targets depend on, so the checkout fetches submodules.
+#
+# Needs the macos-26 image (Xcode 26.x default): the app targets macOS 15 and uses macOS-15+ SwiftUI
+# API, and current XcodeGen (2.45+) emits a project format (objectVersion 77) that Xcode 15 cannot
+# read.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Every string used is in the table, in both languages, and every string in the table is used.
+      - name: Check the string table
+        run: python3 Scripts/checkstrings.py
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build the app (Debug, macOS)
+        run: |
+          xcodebuild \
+            -project CabinePCC.xcodeproj \
+            -scheme CabinePCC \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build the headless tool (Debug, macOS)
+        run: |
+          xcodebuild \
+            -project CabinePCC.xcodeproj \
+            -scheme cabinepcc-headless \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      # On loopback, on ports of its own, with its settings in memory and its files in a scratch folder.
+      - name: Self-test
+        run: build/Build/Products/Debug/cabinepcc-headless --selftest
