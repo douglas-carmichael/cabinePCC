@@ -81,11 +81,14 @@ Arguments at launch, each for that launch alone:
   controls (service, the general emergency stop, the headway) with the library, a button for each line
   the PCC holds; the SCADA annunciator, with acknowledgement and clearing as ISA-18.2 has them; and
   beneath them, scrolling, the PCC and its listener, a diagram of the line's two tracks with every train
-  on them, a card for each cab with its orders (hold, release, emergency brake, message, call), the
-  connections, the trains, the journal, and the library with where each line's data came from. The foot
-  opens the other windows and switches language (English, French) and display (retro, ISA-101). Keys: `?`
-  or F1 for the help, `L` for the language, `T` for the display, `D` for a DCL Terminal, `E` for the
-  general emergency stop, `Q` to quit.
+  on them, a card for each cab, the connections, the trains, the journal, and the library with where each
+  line's data came from. A cab's card has what the cab says of itself, where its train is, its movement
+  authority, its orders (hold, release, emergency brake, message, call), and a close view of the stretch
+  of the line it is on, from the platform behind it to the one after the next: the whole line fills the
+  diagram's width, so that on a long one a train at full speed crosses a point of it a second, and the
+  close view is where a train is seen to move. The foot opens the other windows and switches language
+  (English, French) and display (retro, ISA-101). Keys: `?` or F1 for the help, `L` for the language, `T`
+  for the display, `D` for a DCL Terminal, `E` for the general emergency stop, `Q` to quit.
 - **DCL Terminal**, any number of them: an OpenVMS DCL shell on a VT320, each window its own session.
   Here it is on `MONITOR LINE`, the line as a mimic board, with a cab in service as train 21:
 

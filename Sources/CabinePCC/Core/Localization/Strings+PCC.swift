@@ -171,6 +171,7 @@ extension Strings {
         add("pcc.side.left",        "ON THE LEFT",                         "À GAUCHE")
         add("pcc.fu.applied",       "APPLIED",                             "SERRÉ")
         add("pcc.fu.released",      "RELEASED",                            "RELÂCHÉ")
+        add("pcc.position.fmt",     "track %d, %.0f m",                    "voie %d, %.0f m")
         add("pcc.station.at",       "AT %@",                               "À %@")
         add("pcc.station.to",       "TO %@",                               "VERS %@")
         add("pcc.deviation.ontime", "ON TIME",                             "À L'HEURE")

@@ -117,7 +117,8 @@ the PCC. None of the simulation is done in it.
 - **The picture.** Four times a second it publishes the server's snapshot (the line, its clock, every
   train, every connection, the library), how the listener stands, and what the journal has gathered. The
   windows observe it; a DCL command asks for a fresh one first, so that what it prints is the moment it
-  was typed.
+  was typed. It also keeps when the picture was taken (`pictureTakenAt`), for the one view that is drawn
+  more often than that ([the windows](#the-windows)).
 - **The orders.** Which line; service, the general emergency stop, headway and fleet size; and for one
   train hold, emergency brake, message and call. Each returns an `Outcome`: done, or refused with a
   `Refusal`. Neither is text.
@@ -189,6 +190,20 @@ is the terminal's line editing and key handling, shared by the windows and telne
   connections, the trains, the journal, and the library with each line's credits. The foot opens a DCL
   Terminal, the credits and the help, and switches language and skin. An order that is refused says why,
   in red, where it was given.
+
+  The two tracks are drawn by one view, `LineDiagram`, at two scales. The line's panel has the whole
+  line, which fills the width whatever its length: on a line of 14 km that is some 14 m to the point, and
+  a train at full speed crosses about a point of it a second, so the panel shows where every train is
+  and not that one is moving. A cab's card has the cab's position in figures (its track, and the metres
+  along it) and a close view (`CabCloseView`) of the stretch its train is on: from the platform behind
+  the train to the one after the next it calls at (`LineDiagram.stretch(round:of:)`), never less than
+  600 m, with that track's metres marked. The train runs in from one end to the middle, with the train
+  ahead and the end of its authority in sight, and the view moves on a station when the train leaves the
+  platform in the middle. The close view is the one thing in the window drawn more often than the
+  picture is renewed: while any train of the line moves it is drawn at the screen's pace, 30 times a
+  second at most, each train carried on from the picture at the speed the picture gives it for the time
+  since it was taken, and for half a second at most, so that a PCC that has stopped shows no train
+  running on.
 - **DCL Terminal** (`DCLShellWindow`, `VTShellView`, `RetroTerminalView`). A VT320 drawn by hand, one
   session a window. The Dispatcher's foot and File ▸ New DCL Terminal open one; so does `-openDCL`
   given to the app at launch, beside the Dispatcher, and `-dcl "command"` opens one and types that
