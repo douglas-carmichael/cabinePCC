@@ -111,6 +111,9 @@ final class PCCLink: ObservableObject {
     @Published private(set) var isSlowToStart = false
     /// The line and everything on it; nil while the PCC is not running.
     @Published private(set) var snapshot: CabinePCC.Snapshot?
+    /// When that picture was taken: a view that is drawn more often than
+    /// the picture is renewed carries the trains on from then.
+    private(set) var pictureTakenAt = Date.distantPast
     /// The last `journalLimit` things that happened, the newest last.
     @Published private(set) var journal: [JournalLine] = []
     /// Where the data of each line of the library came from; none for a
@@ -369,6 +372,7 @@ final class PCCLink: ObservableObject {
         } else {
             idle = nil
         }
+        pictureTakenAt = Date()
         snapshot = fresh
     }
 

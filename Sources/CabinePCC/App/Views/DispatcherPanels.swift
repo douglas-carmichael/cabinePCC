@@ -3,11 +3,12 @@ import CabinePCCKit
 
 // The panels of the PCC Dispatcher that show the line and give it its
 // orders: the PCC itself, the line's controls and its library, the diagram
-// of its two tracks, a card for each cab, the connections, the trains and
-// the journal. Everything they show comes from the link (PCCLink), which
-// publishes the engine's picture four times a second; every order goes to
-// the engine through it, and what the link says became of the order is what
-// the panel shows.
+// of its two tracks, a card for each cab with the stretch of the line its
+// train is on drawn large, the connections, the trains and the journal.
+// Everything they show comes from the link (PCCLink), which publishes the
+// engine's picture four times a second; every order goes to the engine
+// through it, and what the link says became of the order is what the panel
+// shows.
 
 // MARK: - Shared pieces
 
@@ -259,28 +260,10 @@ struct LineDiagramPanel: View {
     let line: CabinePCC.Line
     @EnvironmentObject var language: AppLanguage
 
-    private static let height: CGFloat = 204
-    private static let leftInset: CGFloat = 34
-    /// Room for the name of the last station, which leans to the right.
-    private static let rightInset: CGFloat = 104
-    private static let track1Y: CGFloat = 122
-    private static let track2Y: CGFloat = 162
-    /// The least distance between two station names, and the most
-    /// characters of one that are drawn.
-    private static let labelGap: CGFloat = 24
-    private static let labelLength = 22
-    /// The shortest a train is drawn, however long the line.
-    private static let shortestTrain: CGFloat = 7
-
     var body: some View {
-        let tail = language.t("pcc.diagram.tail")
         BoxPanel(title: language.t("pcc.diagram.title"), accent: RetroTheme.amber) {
             VStack(alignment: .leading, spacing: 6) {
-                Canvas { context, size in
-                    draw(context: context, size: size, tailLabel: tail)
-                }
-                .frame(height: Self.height)
-                .frame(maxWidth: .infinity)
+                LineDiagram(snapshot: snapshot, line: line)
                 legend
             }
         }
@@ -313,22 +296,134 @@ struct LineDiagramPanel: View {
                 .foregroundColor(RetroTheme.amberDim)
         }
     }
+}
+
+/// The drawing of the two tracks: the whole line, as the panel above has
+/// it, or a stretch of it drawn large, as a cab's card has it.
+///
+/// The whole line fills the width whatever its length. On a line of 14 km
+/// that is some 14 m to the point, and a train at full speed crosses about
+/// a point of it a second: it shows where every train is, not that one is
+/// moving. A stretch of a kilometre or so is where a train is seen to move.
+struct LineDiagram: View {
+    let snapshot: CabinePCC.Snapshot
+    let line: CabinePCC.Line
+    /// The stretch that is drawn, in metres along the diagram, which is
+    /// track 1's own measure (a position `uM` of track 2 is at
+    /// `lengthM − uM`); nil for the whole line.
+    var stretch: ClosedRange<Double>?
+    /// In a stretch, the track whose metres are marked.
+    var marked: Int?
+    /// Seconds each train is carried on from where the picture has it, at
+    /// the speed the picture gives it: what has passed since the picture
+    /// was taken, for a view that is drawn more often than the picture is
+    /// renewed.
+    var lead = 0.0
+    @EnvironmentObject var language: AppLanguage
+
+    /// Where things are drawn. The whole line leaves room above it for the
+    /// names of its stations, which lean so that many fit; a stretch
+    /// writes them level, and is lower.
+    private struct Layout {
+        let height: CGFloat
+        let leftInset: CGFloat
+        let rightInset: CGFloat
+        let track1Y: CGFloat
+        let track2Y: CGFloat
+        /// The least distance between two station names.
+        let labelGap: CGFloat
+
+        /// The right inset is room for the name of the last station,
+        /// which leans to the right.
+        static let whole = Layout(height: 204, leftInset: 34, rightInset: 104, track1Y: 122, track2Y: 162, labelGap: 24)
+        static let stretch = Layout(height: 112, leftInset: 10, rightInset: 10, track1Y: 46, track2Y: 86, labelGap: 150)
+    }
+
+    /// The most characters of a station's name that are drawn.
+    private static let labelLength = 22
+    /// The shortest a train is drawn, however long the line.
+    private static let shortestTrain: CGFloat = 7
+    /// A stretch round a train is no shorter than this, and reaches this
+    /// far beyond the platforms at its two ends, in metres.
+    private static let shortestStretch = 600.0
+    private static let stretchMargin = 40.0
+
+    private var layout: Layout { stretch == nil ? .whole : .stretch }
+
+    var body: some View {
+        let tail = language.t("pcc.diagram.tail")
+        Canvas { context, size in
+            draw(context: context, size: size, tailLabel: tail)
+        }
+        .frame(height: layout.height)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// The stretch of the line that a close view of a train shows: from
+    /// the platform behind it to the one after the next it calls at. The
+    /// train runs in from one end to the middle of it, with what it is
+    /// running towards in sight, and the view moves on a station when the
+    /// train leaves the one in the middle.
+    static func stretch(round rame: CabinePCC.Rame, of line: CabinePCC.Line) -> ClosedRange<Double> {
+        let stops = line.track(rame.track).stopsM
+        let length = line.lengthM, train = line.train.lengthM
+        var from = 0.0, to = length
+        if !stops.isEmpty {
+            // The stop it stands at or runs to next; beyond the last of
+            // its track, the last.
+            let next = min(max(rame.station ?? stops.count - 1, 0), stops.count - 1)
+            if next > 0 { from = stops[next - 1] - train - stretchMargin }
+            if next + 1 < stops.count { to = stops[next + 1] + stretchMargin }
+        }
+        // The train itself is in it, wherever its cab says it is bound.
+        from = min(from, rame.uM - train - stretchMargin)
+        to = max(to, rame.uM + stretchMargin)
+        // No shorter than the shortest, and no more than the track.
+        let short = shortestStretch - (to - from)
+        if short > 0 {
+            from -= short / 2
+            to += short / 2
+        }
+        if from < 0 {
+            to -= from
+            from = 0
+        }
+        if to > length {
+            from = max(from - (to - length), 0)
+            to = length
+        }
+        return rame.track == 2 ? (length - to)...(length - from) : from...to
+    }
 
     private func draw(context: GraphicsContext, size: CGSize, tailLabel: String) {
+        let layout = self.layout
         let length = line.lengthM
-        let width = size.width - Self.leftInset - Self.rightInset
+        let width = size.width - layout.leftInset - layout.rightInset
         guard length > 0, width > 80 else { return }
+        let whole = stretch == nil
+        let start = stretch?.lowerBound ?? 0
+        let span = max((stretch?.upperBound ?? length) - start, 1)
         let trainLength = line.train.lengthM
-        let top = Self.track1Y, bottom = Self.track2Y
-        let left = Self.leftInset, right = Self.leftInset + width
+        let top = layout.track1Y, bottom = layout.track2Y
+        let left = layout.leftInset, right = layout.leftInset + width
+        var context = context
+        // A stretch is cut off at the two ends of the view.
+        if !whole { context.clip(to: Path(CGRect(x: left - 4, y: 0, width: width + 8, height: size.height))) }
 
         /// Where a position on a track is drawn. A position `uM` on track 2
-        /// is drawn at `lengthM − uM`.
+        /// is drawn at `lengthM − uM`. The whole line lies between the two
+        /// ends of the diagram; what is beyond a stretch is drawn beyond
+        /// the view, and no further off than a view's width.
         func x(_ track: Int, _ uM: Double) -> CGFloat {
             let along = track == 2 ? length - uM : uM
-            return left + CGFloat(min(max(along / length, 0), 1)) * width
+            let part = (along - start) / span
+            return left + CGFloat(whole ? min(max(part, 0), 1) : min(max(part, -1), 2)) * width
         }
         func y(_ track: Int) -> CGFloat { track == 2 ? bottom : top }
+        /// Where a train's nose is by now.
+        func nose(_ rame: CabinePCC.Rame) -> Double {
+            lead > 0 ? min(rame.uM + max(rame.speedMS, 0) * lead, length) : rame.uM
+        }
         func stroke(_ from: CGPoint, _ to: CGPoint, _ color: Color, width: CGFloat = 1, dash: [CGFloat] = []) {
             var path = Path()
             path.move(to: from)
@@ -350,31 +445,47 @@ struct LineDiagramPanel: View {
             stroke(CGPoint(x: x(track, last), y: level), CGPoint(x: x(track, length), y: level),
                    RetroTheme.amberDim, width: 2, dash: [3, 3])
         }
-        // The loop: the end of each track turns back into the start of the
-        // other.
-        for (edge, bulge) in [(left, CGFloat(-18)), (right, CGFloat(18))] {
-            var turn = Path()
-            turn.move(to: CGPoint(x: edge, y: top))
-            turn.addCurve(to: CGPoint(x: edge, y: bottom),
-                          control1: CGPoint(x: edge + bulge, y: top),
-                          control2: CGPoint(x: edge + bulge, y: bottom))
-            context.stroke(turn, with: .color(RetroTheme.amberDim), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        if whole {
+            // The loop: the end of each track turns back into the start of
+            // the other.
+            for (edge, bulge) in [(left, CGFloat(-18)), (right, CGFloat(18))] {
+                var turn = Path()
+                turn.move(to: CGPoint(x: edge, y: top))
+                turn.addCurve(to: CGPoint(x: edge, y: bottom),
+                              control1: CGPoint(x: edge + bulge, y: top),
+                              control2: CGPoint(x: edge + bulge, y: bottom))
+                context.stroke(turn, with: .color(RetroTheme.amberDim), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            }
+            let tail = Text(tailLabel).font(RetroTheme.monoSm).foregroundColor(RetroTheme.amberDim)
+            context.draw(tail, at: CGPoint(x: left - 18, y: bottom + 30), anchor: .leading)
+            context.draw(tail, at: CGPoint(x: right + 18, y: bottom + 30), anchor: .trailing)
         }
-        let tail = Text(tailLabel).font(RetroTheme.monoSm).foregroundColor(RetroTheme.amberDim)
-        context.draw(tail, at: CGPoint(x: left - 18, y: bottom + 30), anchor: .leading)
-        context.draw(tail, at: CGPoint(x: right + 18, y: bottom + 30), anchor: .trailing)
 
-        // The direction of travel, marked along each track.
+        // The direction of travel, marked along each track: at set places
+        // across the whole line, and every 250 m of a stretch, so that the
+        // marks stay where they are on the line when the view moves on.
         var chevrons = Path()
-        var mark = left + 70
-        while mark < right - 30 {
+        func chevron(at mark: CGFloat) {
             chevrons.move(to: CGPoint(x: mark - 4, y: top - 4))
             chevrons.addLine(to: CGPoint(x: mark, y: top))
             chevrons.addLine(to: CGPoint(x: mark - 4, y: top + 4))
             chevrons.move(to: CGPoint(x: mark + 4, y: bottom - 4))
             chevrons.addLine(to: CGPoint(x: mark, y: bottom))
             chevrons.addLine(to: CGPoint(x: mark + 4, y: bottom + 4))
-            mark += 140
+        }
+        if whole {
+            var mark = left + 70
+            while mark < right - 30 {
+                chevron(at: mark)
+                mark += 140
+            }
+        } else {
+            let every = 250.0
+            var along = ((start / every).rounded(.down) + 0.5) * every
+            while along < start + span {
+                if along > start { chevron(at: left + CGFloat((along - start) / span) * width) }
+                along += every
+            }
         }
         context.stroke(chevrons, with: .color(RetroTheme.amberDim), lineWidth: 1)
 
@@ -396,15 +507,17 @@ struct LineDiagramPanel: View {
             stroke(CGPoint(x: x(2, stop2 - trainLength), y: bottom), CGPoint(x: x(2, stop2), y: bottom),
                    RetroTheme.amberBright, width: 4)
         }
-        // Their names lean, so that many fit; where stations crowd, some go
-        // unnamed. The termini are always named.
+        // Their names. Where stations crowd, some go unnamed; across the
+        // whole line the termini are always named.
         var named: [Int] = []
         for index in 0..<count {
-            if let last = named.last, places[index] - places[last] < Self.labelGap { continue }
+            // In a stretch, only the stations that are in it.
+            if !whole, places[index] < left || places[index] > right { continue }
+            if let last = named.last, places[index] - places[last] < layout.labelGap { continue }
             named.append(index)
         }
-        if count > 0, named.last != count - 1 {
-            while named.count > 1, let last = named.last, places[count - 1] - places[last] < Self.labelGap {
+        if whole, count > 0, named.last != count - 1 {
+            while named.count > 1, let last = named.last, places[count - 1] - places[last] < layout.labelGap {
                 named.removeLast()
             }
             named.append(count - 1)
@@ -413,12 +526,45 @@ struct LineDiagramPanel: View {
             var name = names[index]
             if name.count > Self.labelLength { name = String(name.prefix(Self.labelLength - 1)) + "…" }
             let terminus = index == 0 || index == count - 1
-            var leaning = context
-            leaning.translateBy(x: places[index] + 2, y: top - 24)
-            leaning.rotate(by: .degrees(-38))
-            leaning.draw(Text(name).font(RetroTheme.monoSm)
-                            .foregroundColor(terminus ? RetroTheme.amberBright : RetroTheme.amber),
-                         at: .zero, anchor: .leading)
+            let label = Text(name).font(RetroTheme.monoSm)
+                .foregroundColor(terminus ? RetroTheme.amberBright : RetroTheme.amber)
+            if whole {
+                // They lean, so that many fit.
+                var leaning = context
+                leaning.translateBy(x: places[index] + 2, y: top - 24)
+                leaning.rotate(by: .degrees(-38))
+                leaning.draw(label, at: .zero, anchor: .leading)
+            } else {
+                // Level, over the station, and whole: the name of a station
+                // near an end of the view is moved in from it.
+                let resolved = context.resolve(label)
+                let half = resolved.measure(in: CGSize(width: 600, height: 40)).width / 2
+                let centre = min(max(places[index], left + half), max(right - half, left + half))
+                context.draw(resolved, at: CGPoint(x: centre, y: top - 30), anchor: .center)
+            }
+        }
+
+        // In a stretch, the metres of one track: a mark every 100 m on the
+        // side of the other track, and the figure every 200 m, or every
+        // 500 m where the stretch is a long one.
+        if !whole, let marked {
+            let level = y(marked), inward: CGFloat = marked == 2 ? -1 : 1
+            let figures = width / CGFloat(span) >= 0.6 ? 200.0 : 500.0
+            // The track's own metres at the two ends of the view.
+            let first = marked == 2 ? length - (start + span) : start
+            var metres = (first / 100).rounded(.up) * 100
+            while metres <= first + span {
+                let at = x(marked, metres)
+                let figured = metres.truncatingRemainder(dividingBy: figures) == 0
+                stroke(CGPoint(x: at, y: level), CGPoint(x: at, y: level + inward * (figured ? 6 : 3)), RetroTheme.amberDim)
+                // Not across the line that marks a station, nor where an end
+                // of the view would cut it.
+                if figured, at > left + 22, at < right - 22, !places.contains(where: { abs($0 - at) < 26 }) {
+                    context.draw(Text(String(format: "%.0f m", metres)).font(RetroTheme.monoSm).foregroundColor(RetroTheme.amberDim),
+                                 at: CGPoint(x: at, y: (top + bottom) / 2), anchor: .center)
+                }
+                metres += 100
+            }
         }
 
         // Each cab's movement authority: a line from its nose to where its
@@ -427,7 +573,10 @@ struct LineDiagramPanel: View {
             guard let cab = rame.cab, cab.link == .live, let authority = cab.authority,
                   authority.track == rame.track else { continue }
             let level = rame.track == 2 ? bottom - 9 : top + 9
-            let from = x(rame.track, rame.uM), to = x(rame.track, max(authority.endM, rame.uM))
+            let head = nose(rame)
+            let from = x(rame.track, head), to = x(rame.track, max(authority.endM, head))
+            // One that lies wholly beyond the view is not drawn.
+            if max(from, to) < left - 8 || min(from, to) > right + 8 { continue }
             let color: Color
             switch authority.reason {
             case .emergency:      color = RetroTheme.red
@@ -444,13 +593,16 @@ struct LineDiagramPanel: View {
         for rame in order {
             let towards: CGFloat = rame.track == 2 ? -1 : 1
             let level = y(rame.track)
-            let nose = x(rame.track, rame.uM)
-            let rear = nose - towards * max(CGFloat(rame.lengthM / length) * width, Self.shortestTrain)
+            let front = x(rame.track, nose(rame))
+            let rear = front - towards * max(CGFloat(rame.lengthM / span) * width, Self.shortestTrain)
+            // Nor is a train: a stretch is drawn many times a second, and
+            // most of the line's trains are not in it.
+            if max(front, rear) < left - 8 || min(front, rear) > right + 8 { continue }
             var shape = Path()
             shape.move(to: CGPoint(x: rear, y: level - 4))
-            shape.addLine(to: CGPoint(x: nose - towards * 3, y: level - 4))
-            shape.addLine(to: CGPoint(x: nose, y: level))
-            shape.addLine(to: CGPoint(x: nose - towards * 3, y: level + 4))
+            shape.addLine(to: CGPoint(x: front - towards * 3, y: level - 4))
+            shape.addLine(to: CGPoint(x: front, y: level))
+            shape.addLine(to: CGPoint(x: front - towards * 3, y: level + 4))
             shape.addLine(to: CGPoint(x: rear, y: level + 4))
             shape.closeSubpath()
 
@@ -466,8 +618,36 @@ struct LineDiagramPanel: View {
             }
             context.draw(Text(PCCText.number(rame.number)).font(RetroTheme.monoSm)
                             .foregroundColor(mark.opacity(strength)),
-                         at: CGPoint(x: (nose + rear) / 2, y: level + (rame.track == 2 ? 13 : -13)),
+                         at: CGPoint(x: (front + rear) / 2, y: level + (rame.track == 2 ? 13 : -13)),
                          anchor: .center)
+        }
+    }
+}
+
+/// The stretch of the line a cab's train is on, drawn large in its card:
+/// the train is seen to move along it, with the trains near it, the
+/// platforms and where its authority ends.
+///
+/// The picture of the line is renewed four times a second. A train that
+/// crossed this view in such steps would be seen to jump, so while anything
+/// on the line moves the view is drawn at the screen's own pace, each train
+/// carried on from the picture by the time since it was taken.
+struct CabCloseView: View {
+    let snapshot: CabinePCC.Snapshot
+    let line: CabinePCC.Line
+    let rame: CabinePCC.Rame
+    @EnvironmentObject var link: PCCLink
+
+    /// No train is carried on for longer than this from an old picture, in
+    /// seconds: a PCC that has stopped must not show trains running on.
+    private static let longestLead = 0.5
+
+    var body: some View {
+        let moving = snapshot.rames.contains { $0.speedMS > 0.05 }
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !moving)) { timeline in
+            LineDiagram(snapshot: snapshot, line: line,
+                        stretch: LineDiagram.stretch(round: rame, of: line), marked: rame.track,
+                        lead: min(max(timeline.date.timeIntervalSince(link.pictureTakenAt), 0), Self.longestLead))
         }
     }
 }
@@ -492,19 +672,21 @@ struct CabsSection: View {
         } else {
             ForEach(cabs) { rame in
                 if let cab = rame.cab {
-                    CabCard(rame: rame, cab: cab, capacity: line.train.capacity)
+                    CabCard(rame: rame, cab: cab, snapshot: snapshot, line: line)
                 }
             }
         }
     }
 }
 
-/// One cab: what it says of itself, what the PCC has given it leave to do,
-/// and the orders the operator can give it.
+/// One cab: what it says of itself and where its train is, what the PCC has
+/// given it leave to do, the stretch of the line it is on, and the orders
+/// the operator can give it.
 struct CabCard: View {
     let rame: CabinePCC.Rame
     let cab: CabinePCC.Cab
-    let capacity: Int
+    let snapshot: CabinePCC.Snapshot
+    let line: CabinePCC.Line
     @EnvironmentObject var link: PCCLink
     @EnvironmentObject var language: AppLanguage
     @State private var message = ""
@@ -531,7 +713,9 @@ struct CabCard: View {
                                value: PCCText.emergencyBrake(cab, words),
                                valueColor: cab.emergencyBrake ? RetroTheme.red : RetroTheme.amberDim)
                     StatusLine(label: label("pcc.label.pax"),
-                               value: PCCText.passengers(cab, capacity: capacity))
+                               value: PCCText.passengers(cab, capacity: line.train.capacity))
+                    StatusLine(label: label("pcc.label.position"),
+                               value: PCCText.position(of: rame, words))
                     StatusLine(label: label("pcc.label.speed"),
                                value: String(format: "%.1f m/s", rame.speedMS),
                                valueColor: rame.speedMS > 0.5 ? RetroTheme.green : RetroTheme.amberDim)
@@ -558,6 +742,7 @@ struct CabCard: View {
                                value: cab.lastReport.map { PCCText.report($0, words) }
                                    ?? language.t("pcc.report.never"),
                                valueColor: cab.lastReport == nil ? RetroTheme.amberDim : RetroTheme.amberBright)
+                CabCloseView(snapshot: snapshot, line: line, rame: rame)
                 orders
                 if let note {
                     Text(note.text)

@@ -154,6 +154,11 @@ enum PCCText {
         return String(format: t(seconds > 0 ? "pcc.deviation.late" : "pcc.deviation.early"), abs(seconds))
     }
 
+    /// Where a train's nose is: its track, and the metres along it.
+    static func position(of rame: CabinePCC.Rame, _ t: Lookup) -> String {
+        String(format: t("pcc.position.fmt"), rame.track, rame.uM)
+    }
+
     /// The station a train stands at, or runs to.
     static func station(of rame: CabinePCC.Rame, _ t: Lookup) -> String {
         guard let name = rame.stationName else { return "--" }
